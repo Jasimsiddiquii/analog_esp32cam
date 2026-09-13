@@ -7,6 +7,11 @@
 #include "esp_arduino_version.h"
 
 #include "mechanical_ocr_types.h"
+
+#ifndef MACHINESENS_MECH_TYPES_V4
+#error "Wrong/old mechanical_ocr_types.h. Replace it with the updated one from this package."
+#endif
+
 #include "mechanical_templates_int8.h"
 
 static_assert(
@@ -18,7 +23,7 @@ static_assert(
 
 
 // ============================================================================
-// MachineSens - Mechanical Roller Meter ESP32-CAM FINAL - USER VALIDATED INT8 - COMPILE FIX
+// MachineSens - Mechanical Roller Meter ESP32-CAM V4.4 - RED DIGIT SHAPE FIX
 // UI matched to the user's existing MachineSens digital-meter setup page.
 //
 // OCR path is a direct embedded port of the Python reader that passed INT8 parity:
@@ -86,6 +91,12 @@ size_t latestJpegLen = 0;
 int latestJpegW = 0;
 int latestJpegH = 0;
 
+// Last black/white OCR mask shown on the webpage.
+// This is the exact selected preprocessing mask used for the most recent read.
+uint8_t* lastOcrMask = nullptr;
+int lastOcrMaskW = 0;
+int lastOcrMaskH = 0;
+
 
 struct CameraUiSettings {
   int brightness = 0;
@@ -126,7 +137,18 @@ struct CameraUiSettings {
 
 CameraUiSettings camUi;
 
+static void clearLastOcrMask() {
+  if (lastOcrMask) {
+    free(lastOcrMask);
+    lastOcrMask = nullptr;
+  }
+
+  lastOcrMaskW = 0;
+  lastOcrMaskH = 0;
+}
+
 static void clearLatestJpeg() {
+  clearLastOcrMask();
   if (latestJpeg) {
     free(latestJpeg);
     latestJpeg = nullptr;
@@ -677,6 +699,307 @@ static uint8_t* mechMakeMask(
   }
 
   // 2x2 erosion.
+  for (int y = 0;
+       y < roiHeight;
+       ++y) {
+    for (int x = 0;
+         x < roiWidth;
+         ++x) {
+      uint8_t value =
+          255;
+
+      for (int dy = -1;
+           dy <= 0 &&
+           value != 0;
+           ++dy) {
+        const int yy =
+            y + dy;
+
+        if (yy < 0 ||
+            yy >= roiHeight) {
+          continue;
+        }
+
+        for (int dx = -1;
+             dx <= 0;
+             ++dx) {
+          const int xx =
+              x + dx;
+
+          if (xx < 0 ||
+              xx >= roiWidth) {
+            continue;
+          }
+
+          if (!temporary[
+                  yy *
+                      roiWidth +
+                  xx]) {
+            value =
+                0;
+
+            break;
+          }
+        }
+      }
+
+      mask[
+          y *
+              roiWidth +
+          x] =
+          value;
+    }
+  }
+
+  free(temporary);
+
+  return mask;
+}
+
+
+// ============================================================================
+// COLOR-SAFE WHITE-INK MASK
+//
+// Designed for roller digits printed in white over RED / ORANGE / GREEN /
+// BLACK backgrounds.
+//
+// Key idea:
+//   white digit      -> R, G and B are all high
+//   red background   -> R can be high, but G/B are much lower
+//
+// Therefore min(R,G,B) isolates the white printed number without turning the
+// colored roller background into a solid white rectangle.
+// ============================================================================
+static uint8_t* mechMakeWhiteInkMask(
+    const uint16_t* frame,
+    int frameWidth,
+    int frameHeight,
+    int roiX,
+    int roiY,
+    int roiWidth,
+    int roiHeight) {
+  if (!frame ||
+      frameWidth <= 0 ||
+      frameHeight <= 0 ||
+      roiWidth <= 0 ||
+      roiHeight <= 0) {
+    return nullptr;
+  }
+
+  roiX =
+      max(0, roiX);
+
+  roiY =
+      max(0, roiY);
+
+  if (roiX + roiWidth >
+      frameWidth) {
+    roiWidth =
+        frameWidth -
+        roiX;
+  }
+
+  if (roiY + roiHeight >
+      frameHeight) {
+    roiHeight =
+        frameHeight -
+        roiY;
+  }
+
+  if (roiWidth <= 0 ||
+      roiHeight <= 0) {
+    return nullptr;
+  }
+
+  uint32_t histogram[256] = {0};
+  uint32_t count = 0;
+
+  // Histogram of min(R,G,B).
+  // A colored background is naturally suppressed because at least one
+  // channel is low; white ink stays bright in all three channels.
+  for (int y = 0;
+       y < roiHeight;
+       ++y) {
+    const uint16_t* row =
+        frame +
+        (roiY + y) *
+            frameWidth +
+        roiX;
+
+    for (int x = 0;
+         x < roiWidth;
+         ++x) {
+      const uint8_t r =
+          mechR5To8(
+              row[x]);
+
+      const uint8_t g =
+          mechG6To8(
+              row[x]);
+
+      const uint8_t b =
+          mechB5To8(
+              row[x]);
+
+      const uint8_t whiteLevel =
+          min(
+              r,
+              min(
+                  g,
+                  b));
+
+      histogram[
+          whiteLevel]++;
+
+      count++;
+    }
+  }
+
+  int threshold =
+      115;
+
+  if (count > 100) {
+    threshold =
+        mechOtsuThreshold(
+            histogram,
+            count);
+  }
+
+  // Keep threshold practical for OV2640 stills:
+  // too low admits colored roller paint;
+  // too high can erase dim white digits.
+  threshold =
+      constrain(
+          threshold,
+          70,
+          190);
+
+  const size_t pixelCount =
+      static_cast<size_t>(
+          roiWidth) *
+      roiHeight;
+
+  uint8_t* mask =
+      static_cast<uint8_t*>(
+          heap_caps_malloc(
+              pixelCount,
+              MALLOC_CAP_SPIRAM |
+                  MALLOC_CAP_8BIT));
+
+  uint8_t* temporary =
+      static_cast<uint8_t*>(
+          heap_caps_malloc(
+              pixelCount,
+              MALLOC_CAP_SPIRAM |
+                  MALLOC_CAP_8BIT));
+
+  if (!mask ||
+      !temporary) {
+    free(mask);
+    free(temporary);
+
+    return nullptr;
+  }
+
+  // Binary mask from min(R,G,B).
+  for (int y = 0;
+       y < roiHeight;
+       ++y) {
+    const uint16_t* row =
+        frame +
+        (roiY + y) *
+            frameWidth +
+        roiX;
+
+    uint8_t* output =
+        mask +
+        y *
+            roiWidth;
+
+    for (int x = 0;
+         x < roiWidth;
+         ++x) {
+      const uint8_t r =
+          mechR5To8(
+              row[x]);
+
+      const uint8_t g =
+          mechG6To8(
+              row[x]);
+
+      const uint8_t b =
+          mechB5To8(
+              row[x]);
+
+      const uint8_t whiteLevel =
+          min(
+              r,
+              min(
+                  g,
+                  b));
+
+      output[x] =
+          (whiteLevel >
+           threshold)
+              ? 255
+              : 0;
+    }
+  }
+
+  // Same 2x2 MORPH_CLOSE used by the Python-style mask.
+  // Dilation, anchor=(1,1).
+  for (int y = 0;
+       y < roiHeight;
+       ++y) {
+    for (int x = 0;
+         x < roiWidth;
+         ++x) {
+      uint8_t value = 0;
+
+      for (int dy = -1;
+           dy <= 0 &&
+           value == 0;
+           ++dy) {
+        const int yy =
+            y + dy;
+
+        if (yy < 0 ||
+            yy >= roiHeight) {
+          continue;
+        }
+
+        for (int dx = -1;
+             dx <= 0;
+             ++dx) {
+          const int xx =
+              x + dx;
+
+          if (xx < 0 ||
+              xx >= roiWidth) {
+            continue;
+          }
+
+          if (mask[
+                  yy *
+                      roiWidth +
+                  xx]) {
+            value =
+                255;
+
+            break;
+          }
+        }
+      }
+
+      temporary[
+          y *
+              roiWidth +
+          x] =
+          value;
+    }
+  }
+
+  // Erosion.
   for (int y = 0;
        y < roiHeight;
        ++y) {
@@ -1694,6 +2017,168 @@ static int mechCountHoles(
   return holes;
 }
 
+
+static bool mechShapeStronglyLooksLike2(
+    const uint8_t image[
+        MECH_INT8_TEMPLATE_PIXELS]) {
+  // Tight ink bounding box first, so the test is independent of centering.
+  int minX =
+      MECH_INT8_TEMPLATE_W;
+
+  int maxX =
+      -1;
+
+  int minY =
+      MECH_INT8_TEMPLATE_H;
+
+  int maxY =
+      -1;
+
+  for (int y = 0;
+       y < MECH_INT8_TEMPLATE_H;
+       ++y) {
+    for (int x = 0;
+         x < MECH_INT8_TEMPLATE_W;
+         ++x) {
+      if (image[
+              y *
+                  MECH_INT8_TEMPLATE_W +
+              x] >
+          127) {
+        minX =
+            min(
+                minX,
+                x);
+
+        maxX =
+            max(
+                maxX,
+                x);
+
+        minY =
+            min(
+                minY,
+                y);
+
+        maxY =
+            max(
+                maxY,
+                y);
+      }
+    }
+  }
+
+  if (maxX <= minX ||
+      maxY <= minY) {
+    return false;
+  }
+
+  const int width =
+      maxX -
+      minX +
+      1;
+
+  const int height =
+      maxY -
+      minY +
+      1;
+
+  auto bandCentroid =
+      [&](float yStart,
+          float yEnd,
+          float& centroid) -> bool {
+        int startY =
+            minY +
+            static_cast<int>(
+                floorf(
+                    height *
+                    yStart));
+
+        int endY =
+            minY +
+            static_cast<int>(
+                ceilf(
+                    height *
+                    yEnd));
+
+        startY =
+            constrain(
+                startY,
+                minY,
+                maxY);
+
+        endY =
+            constrain(
+                endY,
+                startY + 1,
+                maxY + 1);
+
+        uint32_t xSum = 0;
+        uint32_t count = 0;
+
+        for (int y = startY;
+             y < endY;
+             ++y) {
+          for (int x = minX;
+               x <= maxX;
+               ++x) {
+            if (image[
+                    y *
+                        MECH_INT8_TEMPLATE_W +
+                    x] >
+                127) {
+              xSum +=
+                  static_cast<uint32_t>(
+                      x -
+                      minX);
+
+              count++;
+            }
+          }
+        }
+
+        if (count == 0) {
+          return false;
+        }
+
+        centroid =
+            static_cast<float>(
+                xSum) /
+            count /
+            max(
+                1,
+                width - 1);
+
+        return true;
+      };
+
+  float middleCentroid =
+      1.0f;
+
+  float lowerCentroid =
+      1.0f;
+
+  // These bands are intentionally away from the top/bottom horizontal bars.
+  if (!bandCentroid(
+          0.50f,
+          0.65f,
+          middleCentroid) ||
+      !bandCentroid(
+          0.68f,
+          0.84f,
+          lowerCentroid)) {
+    return false;
+  }
+
+  // A "2" bends left strongly in the lower half.
+  // A "3" remains right-heavy through both middle/lower bands.
+  return
+      middleCentroid <=
+          0.61f &&
+      lowerCentroid <=
+          0.50f;
+}
+
 static void mechClassifyDigit(
     const uint8_t normalized[
         MECH_INT8_TEMPLATE_PIXELS],
@@ -1800,6 +2285,29 @@ static void mechClassifyDigit(
     }
   }
 
+  // ESP32 roller-font rescue: 2 vs 3.
+  //
+  // In the red-background test image, the WHITE-INK mask clearly contains
+  // the shape of "2", but correlation can rank the unusual roller-font stroke
+  // as "3". Only override a LOW/MEDIUM-confidence 3 when the lower-half
+  // trajectory strongly matches a 2.
+  if (bestDigit == '3' &&
+      bestScore <
+          0.78f &&
+      mechShapeStronglyLooksLike2(
+          normalized)) {
+    Serial.printf(
+        "MECH SHAPE RESCUE 3->2 | score3=%.3f score2=%.3f\n",
+        bestScore,
+        scores[2]);
+
+    bestDigit =
+        '2';
+
+    bestScore =
+        scores[2];
+  }
+
   const int chosenDigit =
       bestDigit -
       '0';
@@ -1848,6 +2356,7 @@ static bool mechRunSingleMask(
     int before,
     int after,
     int saturationLimit,
+    bool useWhiteInkMask,
     MechanicalOcrResult* out) {
   if (!out) {
     return false;
@@ -1868,16 +2377,28 @@ static bool mechRunSingleMask(
   out->saturationLimitUsed =
       saturationLimit;
 
+  out->whiteInkMaskUsed =
+      useWhiteInkMask;
+
   uint8_t* mask =
-      mechMakeMask(
-          frame,
-          frameWidth,
-          frameHeight,
-          roiX,
-          roiY,
-          roiWidth,
-          roiHeight,
-          saturationLimit);
+      useWhiteInkMask
+          ? mechMakeWhiteInkMask(
+                frame,
+                frameWidth,
+                frameHeight,
+                roiX,
+                roiY,
+                roiWidth,
+                roiHeight)
+          : mechMakeMask(
+                frame,
+                frameWidth,
+                frameHeight,
+                roiX,
+                roiY,
+                roiWidth,
+                roiHeight,
+                saturationLimit);
 
   if (!mask) {
     mechSetError(
@@ -2092,6 +2613,84 @@ static bool mechRunSingleMask(
   return true;
 }
 
+
+static int mechProbeDigitCount(
+    const uint16_t* frame,
+    int frameWidth,
+    int frameHeight,
+    int roiX,
+    int roiY,
+    int roiWidth,
+    int roiHeight,
+    int saturationLimit) {
+  uint8_t* mask =
+      mechMakeMask(
+          frame,
+          frameWidth,
+          frameHeight,
+          roiX,
+          roiY,
+          roiWidth,
+          roiHeight,
+          saturationLimit);
+
+  if (!mask) {
+    return -1;
+  }
+
+  MechanicalComponent components[
+      MECH_MAX_COMPONENTS];
+
+  const int count =
+      mechFindDigits(
+          mask,
+          roiWidth,
+          roiHeight,
+          components);
+
+  free(mask);
+
+  return count;
+}
+
+
+static int mechProbeWhiteInkDigitCount(
+    const uint16_t* frame,
+    int frameWidth,
+    int frameHeight,
+    int roiX,
+    int roiY,
+    int roiWidth,
+    int roiHeight) {
+  uint8_t* mask =
+      mechMakeWhiteInkMask(
+          frame,
+          frameWidth,
+          frameHeight,
+          roiX,
+          roiY,
+          roiWidth,
+          roiHeight);
+
+  if (!mask) {
+    return -1;
+  }
+
+  MechanicalComponent components[
+      MECH_MAX_COMPONENTS];
+
+  const int count =
+      mechFindDigits(
+          mask,
+          roiWidth,
+          roiHeight,
+          components);
+
+  free(mask);
+
+  return count;
+}
+
 static float mechResultEvidence(
     const MechanicalOcrResult& result) {
   if (!result.success ||
@@ -2099,14 +2698,55 @@ static float mechResultEvidence(
     return -999.0f;
   }
 
+  float solidBlobPenalty =
+      0.0f;
+
+  for (int i = 0;
+       i < result.detectedDigits;
+       ++i) {
+    const MechanicalComponent& c =
+        result.digits[i].component;
+
+    const int boxArea =
+        max(
+            1,
+            c.w *
+            c.h);
+
+    const float fill =
+        static_cast<float>(
+            c.area) /
+        boxArea;
+
+    // A real printed digit normally contains substantial black space.
+    // A colored roller panel accidentally converted to white is close to
+    // a completely filled rectangle.
+    if (fill >
+        0.82f) {
+      solidBlobPenalty +=
+          0.35f +
+          (fill -
+           0.82f);
+    }
+  }
+
+  solidBlobPenalty /=
+      max(
+          1,
+          result.detectedDigits);
+
   return
       result.averageScore +
       0.65f *
-          result.averageMargin;
+          result.averageMargin -
+      solidBlobPenalty;
 }
 
-// Python S<110 is always tried first.
-// S<125 is only an embedded rescue for RGB565 color quantization.
+// Python S<110 remains the baseline.
+// ESP32 RGB565 can increase apparent saturation compared with the desktop
+// BGR image, so we probe a small set of saturation limits WITHOUT changing
+// the frozen INT8 classifier. Expected digit count (BEFORE+AFTER) is used
+// only to choose the best segmentation candidate.
 static bool mechanicalReadRgb565(
     const uint16_t* frame,
     int frameWidth,
@@ -2151,192 +2791,342 @@ static bool mechanicalReadRgb565(
     return false;
   }
 
-  MechanicalOcrResult pythonMask = {};
-  MechanicalOcrResult rgb565Rescue = {};
+  // IMPORTANT:
+  // This changes preprocessing selection only.
+  // Your validated mechanical_templates_int8.h is untouched.
+  static const int saturationLimits[] = {
+      110,
+      125,
+      140,
+      150,
+      160};
 
-  const bool pythonOk =
-      mechRunSingleMask(
-          frame,
-          frameWidth,
-          frameHeight,
-          roiX,
-          roiY,
-          roiWidth,
-          roiHeight,
-          before,
-          after,
-          110,
-          &pythonMask);
+  constexpr int LIMIT_COUNT =
+      sizeof(saturationLimits) /
+      sizeof(saturationLimits[0]);
 
-  // If baseline has exact count and strong evidence, keep the Python path.
-  const bool pythonStrong =
-      pythonOk &&
-      pythonMask.detectedDigits ==
-          expectedDigits &&
-      pythonMask.averageScore >=
-          0.78f &&
-      pythonMask.averageMargin >=
-          0.10f;
+  int counts[LIMIT_COUNT];
 
-  if (pythonStrong) {
-    *out =
-        pythonMask;
+  Serial.printf(
+      "MECH SEGMENT PROBE expected=%d: ",
+      expectedDigits);
 
-    out->rgb565RescueUsed =
-        false;
+  for (int i = 0;
+       i < LIMIT_COUNT;
+       ++i) {
+    counts[i] =
+        mechProbeDigitCount(
+            frame,
+            frameWidth,
+            frameHeight,
+            roiX,
+            roiY,
+            roiWidth,
+            roiHeight,
+            saturationLimits[i]);
 
-    return true;
+    Serial.printf(
+        "S<%d=%d%s",
+        saturationLimits[i],
+        counts[i],
+        (i + 1 <
+         LIMIT_COUNT)
+            ? " "
+            : "\n");
   }
 
-  const bool rescueOk =
-      mechRunSingleMask(
+  const int whiteInkCount =
+      mechProbeWhiteInkDigitCount(
           frame,
           frameWidth,
           frameHeight,
           roiX,
           roiY,
           roiWidth,
-          roiHeight,
-          before,
-          after,
-          125,
-          &rgb565Rescue);
+          roiHeight);
 
-  if (!pythonOk &&
-      !rescueOk) {
+  Serial.printf(
+      "WHITE_INK=%d\n",
+      whiteInkCount);
+
+  bool haveCandidate =
+      false;
+
+  MechanicalOcrResult bestResult = {};
+
+  float bestEvidence =
+      -999.0f;
+
+  int bestDistance =
+      999;
+
+  int bestLimit =
+      110;
+
+  bool bestWhiteInk =
+      false;
+
+  // First evaluate the color-safe WHITE-INK mask when it finds the
+  // configured number of digits. This is the important rescue for a white
+  // digit printed over a red roller background.
+  if (whiteInkCount ==
+      expectedDigits) {
+    MechanicalOcrResult whiteCandidate = {};
+
+    if (mechRunSingleMask(
+            frame,
+            frameWidth,
+            frameHeight,
+            roiX,
+            roiY,
+            roiWidth,
+            roiHeight,
+            before,
+            after,
+            110,
+            true,
+            &whiteCandidate)) {
+      const float evidence =
+          mechResultEvidence(
+              whiteCandidate);
+
+      bestResult =
+          whiteCandidate;
+
+      bestEvidence =
+          evidence;
+
+      bestDistance =
+          0;
+
+      bestLimit =
+          110;
+
+      bestWhiteInk =
+          true;
+
+      haveCandidate =
+          true;
+    }
+  }
+
+  // Pass 1:
+  // classify exact-count saturation masks too.
+  for (int i = 0;
+       i < LIMIT_COUNT;
+       ++i) {
+    if (counts[i] !=
+        expectedDigits) {
+      continue;
+    }
+
+    MechanicalOcrResult candidate = {};
+
+    if (!mechRunSingleMask(
+            frame,
+            frameWidth,
+            frameHeight,
+            roiX,
+            roiY,
+            roiWidth,
+            roiHeight,
+            before,
+            after,
+            saturationLimits[i],
+            false,
+            &candidate)) {
+      continue;
+    }
+
+    const float evidence =
+        mechResultEvidence(
+            candidate);
+
+    // Prefer stronger classifier evidence.
+    // If effectively tied, stay closer to the Python baseline S<110.
+    if (!haveCandidate ||
+        evidence >
+            bestEvidence +
+                0.003f ||
+        (fabsf(
+             evidence -
+             bestEvidence) <=
+             0.003f &&
+         abs(
+             saturationLimits[i] -
+             110) <
+             abs(
+                 bestLimit -
+                 110))) {
+      bestResult =
+          candidate;
+
+      bestEvidence =
+          evidence;
+
+      bestDistance =
+          0;
+
+      bestLimit =
+          saturationLimits[i];
+
+      bestWhiteInk =
+          false;
+
+      haveCandidate =
+          true;
+    }
+  }
+
+  // Pass 2:
+  // If no exact-count candidate exists, also consider the WHITE-INK mask
+  // alongside the closest saturation mask.
+  if (!haveCandidate) {
+    if (whiteInkCount > 0) {
+      MechanicalOcrResult whiteCandidate = {};
+
+      if (mechRunSingleMask(
+              frame,
+              frameWidth,
+              frameHeight,
+              roiX,
+              roiY,
+              roiWidth,
+              roiHeight,
+              before,
+              after,
+              110,
+              true,
+              &whiteCandidate)) {
+        const int distance =
+            abs(
+                whiteCandidate.detectedDigits -
+                expectedDigits);
+
+        bestResult =
+            whiteCandidate;
+
+        bestEvidence =
+            mechResultEvidence(
+                whiteCandidate);
+
+        bestDistance =
+            distance;
+
+        bestLimit =
+            110;
+
+        bestWhiteInk =
+            true;
+
+        haveCandidate =
+            true;
+      }
+    }
+
+    for (int i = 0;
+         i < LIMIT_COUNT;
+         ++i) {
+      if (counts[i] <= 0) {
+        continue;
+      }
+
+      const int distance =
+          abs(
+              counts[i] -
+              expectedDigits);
+
+      if (distance >
+          bestDistance) {
+        continue;
+      }
+
+      MechanicalOcrResult candidate = {};
+
+      if (!mechRunSingleMask(
+              frame,
+              frameWidth,
+              frameHeight,
+              roiX,
+              roiY,
+              roiWidth,
+              roiHeight,
+              before,
+              after,
+              saturationLimits[i],
+              false,
+            &candidate)) {
+        continue;
+      }
+
+      const float evidence =
+          mechResultEvidence(
+              candidate);
+
+      if (!haveCandidate ||
+          distance <
+              bestDistance ||
+          (distance ==
+               bestDistance &&
+           evidence >
+               bestEvidence +
+                   0.003f)) {
+        bestResult =
+            candidate;
+
+        bestEvidence =
+            evidence;
+
+        bestDistance =
+            distance;
+
+        bestLimit =
+            saturationLimits[i];
+
+        haveCandidate =
+            true;
+      }
+    }
+  }
+
+  if (!haveCandidate) {
     mechSetError(
         out,
-        "Mechanical OCR failed at both Python and RGB565-safe masks");
+        "No usable mechanical segmentation candidate");
 
     return false;
   }
 
-  if (!pythonOk) {
-    *out =
-        rgb565Rescue;
+  *out =
+      bestResult;
 
-    out->rgb565RescueUsed =
-        true;
+  out->whiteInkMaskUsed =
+      bestWhiteInk;
 
-    return true;
-  }
+  out->rgb565RescueUsed =
+      bestWhiteInk ||
+      bestLimit !=
+          110;
 
-  if (!rescueOk) {
-    *out =
-        pythonMask;
-
-    out->rgb565RescueUsed =
-        false;
-
-    return true;
-  }
-
-  const bool pythonExact =
-      pythonMask.detectedDigits ==
-      expectedDigits;
-
-  const bool rescueExact =
-      rgb565Rescue.detectedDigits ==
-      expectedDigits;
-
-  // Exact expected count wins.
-  if (pythonExact &&
-      !rescueExact) {
-    *out =
-        pythonMask;
-
-    out->rgb565RescueUsed =
-        false;
-
-    return true;
-  }
-
-  if (rescueExact &&
-      !pythonExact) {
-    *out =
-        rgb565Rescue;
-
-    out->rgb565RescueUsed =
-        true;
-
-    return true;
-  }
-
-  // If both produced the exact same reading, keep Python baseline.
-  if (pythonExact &&
-      rescueExact &&
-      strcmp(
-          pythonMask.raw,
-          rgb565Rescue.raw) ==
-          0) {
-    *out =
-        pythonMask;
-
-    out->rgb565RescueUsed =
-        false;
-
-    return true;
-  }
-
-  // Same digit count but disagreement:
-  // choose stronger template score+margin evidence.
-  if (pythonMask.detectedDigits ==
-      rgb565Rescue.detectedDigits) {
-    const float pythonEvidence =
-        mechResultEvidence(
-            pythonMask);
-
-    const float rescueEvidence =
-        mechResultEvidence(
-            rgb565Rescue);
-
-    if (rescueEvidence >
-        pythonEvidence +
-            0.015f) {
-      *out =
-          rgb565Rescue;
-
-      out->rgb565RescueUsed =
-          true;
-    }
-
-    else {
-      *out =
-          pythonMask;
-
-      out->rgb565RescueUsed =
-          false;
-    }
-
-    return true;
-  }
-
-  // Otherwise choose the count closer to BEFORE+AFTER.
-  const int pythonDistance =
-      abs(
-          pythonMask.detectedDigits -
-          expectedDigits);
-
-  const int rescueDistance =
-      abs(
-          rgb565Rescue.detectedDigits -
-          expectedDigits);
-
-  if (rescueDistance <
-      pythonDistance) {
-    *out =
-        rgb565Rescue;
-
-    out->rgb565RescueUsed =
-        true;
+  if (bestWhiteInk) {
+    Serial.printf(
+        "MECH SEGMENT SELECT WHITE_INK minRGB | %d/%d | reading=%s | score=%.3f margin=%.3f\n",
+        out->detectedDigits,
+        out->expectedDigits,
+        out->reading,
+        out->averageScore,
+        out->averageMargin);
   }
 
   else {
-    *out =
-        pythonMask;
-
-    out->rgb565RescueUsed =
-        false;
+    Serial.printf(
+        "MECH SEGMENT SELECT S<%d | %d/%d | reading=%s | score=%.3f margin=%.3f\n",
+        bestLimit,
+        out->detectedDigits,
+        out->expectedDigits,
+        out->reading,
+        out->averageScore,
+        out->averageMargin);
   }
 
   return true;
@@ -2618,6 +3408,38 @@ select{
   height:22px;
 }
 
+.mask-panel{
+  margin-top:12px;
+  padding:12px;
+  border:1px solid var(--border);
+  border-radius:10px;
+  background:#05070a;
+}
+
+.mask-title{
+  font-size:13px;
+  font-weight:bold;
+  margin-bottom:8px;
+}
+
+.mask-subtitle{
+  color:var(--muted);
+  font-size:11px;
+  margin-bottom:9px;
+}
+
+#maskImage{
+  display:block;
+  width:100%;
+  height:auto;
+  max-height:280px;
+  object-fit:contain;
+  background:#000;
+  border:1px solid #30363d;
+  border-radius:7px;
+  image-rendering:pixelated;
+}
+
 .details{
   margin-top:12px;
   padding:12px;
@@ -2684,7 +3506,7 @@ select{
 <header>
   <h1>MachineSens Mechanical Meter Camera</h1>
   <div class="subtitle">
-    VGA Live → XGA 1024×768 Q3 Still → Frozen INT8 Mechanical OCR
+    VGA Live → XGA Still → Frozen INT8 OCR · White-Ink Red-Background Rescue · Mask Preview
   </div>
 </header>
 
@@ -2720,20 +3542,36 @@ select{
             <div>
               <div class="reading-label">Digits BEFORE decimal</div>
               <select id="digitsBefore" onchange="updateExpectedDigits()">
-                <option>0</option><option>1</option><option>2</option>
-                <option>3</option><option>4</option><option>5</option>
-                <option selected>6</option><option>7</option><option>8</option>
-                <option>9</option><option>10</option><option>11</option>
-                <option>12</option><option>13</option><option>14</option>
-                <option>15</option><option>16</option>
+                <option>0</option>
+                <option>1</option>
+                <option>2</option>
+                <option>3</option>
+                <option>4</option>
+                <option>5</option>
+                <option selected>6</option>
+                <option>7</option>
+                <option>8</option>
+                <option>9</option>
+                <option>10</option>
+                <option>11</option>
+                <option>12</option>
+                <option>13</option>
+                <option>14</option>
+                <option>15</option>
+                <option>16</option>
               </select>
             </div>
 
             <div>
               <div class="reading-label">Digits AFTER decimal</div>
               <select id="digitsAfter" onchange="updateExpectedDigits()">
-                <option selected>1</option><option>0</option><option>2</option>
-                <option>3</option><option>4</option>
+                <option>0</option>
+                <option selected>1</option>
+                <option>2</option>
+                <option>3</option>
+                <option>4</option>
+                <option>5</option>
+                <option>6</option>
               </select>
             </div>
           </div>
@@ -2763,6 +3601,14 @@ select{
         <div id="readingInfo" class="info">
           Take a photo, crop the roller digits, choose the digit format, then press READ MECHANICAL.
         </div>
+      </div>
+
+      <div id="maskPanel" class="mask-panel hidden">
+        <div class="mask-title">OCR BLACK / WHITE MASK</div>
+        <div class="mask-subtitle">
+          This is the exact binary crop the ESP32 uses to find the roller digits.
+        </div>
+        <img id="maskImage" alt="Black and white OCR mask">
       </div>
 
       <div id="resultDetails" class="details">No OCR result yet.</div>
@@ -3081,6 +3927,12 @@ let capturedObjectUrl = null;
 let streamRetryTimer = null;
 let streamGeneration = 0;
 
+// OCR digit boxes returned by ESP32.
+// Coordinates are relative to the OCR crop, not the whole photograph.
+let digitBoxes = [];
+let digitBoxRoiW = 1;
+let digitBoxRoiH = 1;
+
 function sleepMs(ms){
   return new Promise(resolve=>setTimeout(resolve,ms));
 }
@@ -3183,7 +4035,8 @@ function drawCrop(){
     return;
   }
 
-  ctx.fillStyle='rgba(0,255,85,.10)';
+  // Main roller crop.
+  ctx.fillStyle='rgba(0,255,85,.06)';
   ctx.fillRect(cropRect.x,cropRect.y,cropRect.w,cropRect.h);
 
   ctx.strokeStyle='#00ff55';
@@ -3197,6 +4050,41 @@ function drawCrop(){
     cropRect.x+5,
     Math.max(17,cropRect.y-5)
   );
+
+  // After OCR, draw one clear box around every component that the ESP32
+  // actually classified as a digit.
+  if(digitBoxes.length && digitBoxRoiW>0 && digitBoxRoiH>0){
+    const scaleX=cropRect.w/digitBoxRoiW;
+    const scaleY=cropRect.h/digitBoxRoiH;
+
+    for(const d of digitBoxes){
+      // Small visual padding so the rectangle surrounds the entire roller
+      // character instead of sitting exactly on the white component pixels.
+      const padX=Math.max(2,3*scaleX);
+      const padY=Math.max(2,3*scaleY);
+
+      const bx=cropRect.x+d.x*scaleX-padX;
+      const by=cropRect.y+d.y*scaleY-padY;
+      const bw=d.w*scaleX+padX*2;
+      const bh=d.h*scaleY+padY*2;
+
+      ctx.strokeStyle='#ffd33d';
+      ctx.lineWidth=3;
+      ctx.strokeRect(bx,by,bw,bh);
+
+      const label=`${d.index}: ${d.digit}`;
+      ctx.font='bold 13px Arial';
+      const textW=ctx.measureText(label).width;
+      const labelX=Math.max(cropRect.x,bx);
+      const labelY=Math.max(cropRect.y+16,by-4);
+
+      ctx.fillStyle='rgba(0,0,0,.82)';
+      ctx.fillRect(labelX-2,labelY-14,textW+6,18);
+
+      ctx.fillStyle='#ffd33d';
+      ctx.fillText(label,labelX+1,labelY);
+    }
+  }
 }
 
 canvas.addEventListener('pointerdown',event=>{
@@ -3211,6 +4099,8 @@ canvas.addEventListener('pointerdown',event=>{
   startX=p.x;
   startY=p.y;
   dragging=true;
+  digitBoxes=[];
+  document.getElementById('maskPanel').classList.add('hidden');
 
   cropRect={
     x:p.x,
@@ -3309,6 +4199,9 @@ async function takePhoto(){
 
     capturedObjectUrl=URL.createObjectURL(blob);
     cropRect=null;
+    digitBoxes=[];
+    document.getElementById('maskPanel').classList.add('hidden');
+    document.getElementById('maskImage').removeAttribute('src');
 
     captured.onload=()=>{
       // IMPORTANT:
@@ -3339,6 +4232,9 @@ async function takePhoto(){
 
 function recrop(){
   cropRect=null;
+  digitBoxes=[];
+  document.getElementById('maskPanel').classList.add('hidden');
+  document.getElementById('maskImage').removeAttribute('src');
   clearCropCanvas();
   captureStatus.textContent='Drag a new crop around ONLY the roller digits.';
 }
@@ -3352,6 +4248,9 @@ async function backToLive(){
   captureMode.classList.add('hidden');
   liveMode.classList.remove('hidden');
   cropRect=null;
+  digitBoxes=[];
+  document.getElementById('maskPanel').classList.add('hidden');
+  document.getElementById('maskImage').removeAttribute('src');
   clearCropCanvas();
   await restartStream(false);
 }
@@ -3396,13 +4295,29 @@ async function confirmCrop(){
 
     document.getElementById('readingValue').textContent=data.reading;
 
+    // Display the exact digit boxes returned by the ESP32.
+    digitBoxes=Array.isArray(data.digits)?data.digits:[];
+    digitBoxRoiW=Math.max(1,data.roi_w||1);
+    digitBoxRoiH=Math.max(1,data.roi_h||1);
+    drawCrop();
+
+    // Display the exact black/white mask used for this OCR result.
+    const maskPanel=document.getElementById('maskPanel');
+    const maskImage=document.getElementById('maskImage');
+    maskPanel.classList.remove('hidden');
+    maskImage.src='/mask?t='+Date.now();
+
     const countOk=data.detected===data.expected;
 
     document.getElementById('readingValue').style.color=
       countOk?'#3fb950':'#d29922';
 
+    const maskName=data.white_ink
+      ?'WHITE-INK color-safe'
+      :(data.rgb565_rescue?'RGB565 saturation rescue':'Python mask');
+
     document.getElementById('readingInfo').textContent=
-      `Detected ${data.detected}/${data.expected} digits · Score ${data.average_score} · ${data.rgb565_rescue?'RGB565 rescue':'Python mask'}`;
+      `Detected ${data.detected}/${data.expected} digits · Score ${data.average_score} · ${maskName}`;
 
     let details=
       `RAW: ${data.raw}\n`+
@@ -3411,7 +4326,7 @@ async function confirmCrop(){
       `DETECTED DIGITS: ${data.detected}\n`+
       `AVERAGE TEMPLATE SCORE: ${data.average_score}\n`+
       `AVERAGE MARGIN: ${data.average_margin}\n`+
-      `MASK: S < ${data.sat_limit}${data.rgb565_rescue?' (RGB565 rescue)':' (Python baseline)'}\n\n`;
+      `MASK: ${data.white_ink?'WHITE-INK min(R,G,B)':('S < '+data.sat_limit)}\n\n`;
 
     for(const d of data.digits){
       details+=
@@ -4376,6 +5291,40 @@ static esp_err_t readHandler(httpd_req_t* req) {
           after,
           &result);
 
+  // Rebuild and retain the EXACT selected binary mask for webpage preview.
+  // This does not change OCR or the validated INT8 templates.
+  clearLastOcrMask();
+
+  if (ok) {
+    lastOcrMask =
+        result.whiteInkMaskUsed
+            ? mechMakeWhiteInkMask(
+                  rgb565,
+                  DECODE_W,
+                  DECODE_H,
+                  decodeX,
+                  decodeY,
+                  decodeWidth,
+                  decodeHeight)
+            : mechMakeMask(
+                  rgb565,
+                  DECODE_W,
+                  DECODE_H,
+                  decodeX,
+                  decodeY,
+                  decodeWidth,
+                  decodeHeight,
+                  result.saturationLimitUsed);
+
+    if (lastOcrMask) {
+      lastOcrMaskW =
+          decodeWidth;
+
+      lastOcrMaskH =
+          decodeHeight;
+    }
+  }
+
   free(rgb565);
 
   if (!ok) {
@@ -4445,6 +5394,23 @@ static esp_err_t readHandler(httpd_req_t* req) {
           result.rgb565RescueUsed
               ? "true"
               : "false");
+
+  json +=
+      ",\"white_ink\":" +
+      String(
+          result.whiteInkMaskUsed
+              ? "true"
+              : "false");
+
+  json +=
+      ",\"roi_w\":" +
+      String(
+          decodeWidth);
+
+  json +=
+      ",\"roi_h\":" +
+      String(
+          decodeHeight);
 
   json +=
       ",\"digits\":[";
@@ -4530,6 +5496,243 @@ static esp_err_t readHandler(httpd_req_t* req) {
   return sendJson(
       req,
       json);
+}
+
+
+static void bmpWrite16(
+    uint8_t* destination,
+    uint16_t value) {
+  destination[0] =
+      static_cast<uint8_t>(
+          value &
+          0xFF);
+
+  destination[1] =
+      static_cast<uint8_t>(
+          (value >> 8) &
+          0xFF);
+}
+
+static void bmpWrite32(
+    uint8_t* destination,
+    uint32_t value) {
+  destination[0] =
+      static_cast<uint8_t>(
+          value &
+          0xFF);
+
+  destination[1] =
+      static_cast<uint8_t>(
+          (value >> 8) &
+          0xFF);
+
+  destination[2] =
+      static_cast<uint8_t>(
+          (value >> 16) &
+          0xFF);
+
+  destination[3] =
+      static_cast<uint8_t>(
+          (value >> 24) &
+          0xFF);
+}
+
+static esp_err_t maskHandler(
+    httpd_req_t* req) {
+  if (!lastOcrMask ||
+      lastOcrMaskW <= 0 ||
+      lastOcrMaskH <= 0) {
+    return sendJson(
+        req,
+        "{\"success\":false,\"message\":\"No OCR mask yet. Read the meter first.\"}",
+        404);
+  }
+
+  const uint32_t width =
+      static_cast<uint32_t>(
+          lastOcrMaskW);
+
+  const uint32_t height =
+      static_cast<uint32_t>(
+          lastOcrMaskH);
+
+  // 8-bit grayscale BMP rows must be aligned to 4 bytes.
+  const uint32_t rowStride =
+      (width + 3U) &
+      ~3U;
+
+  constexpr uint32_t FILE_HEADER_SIZE =
+      14;
+
+  constexpr uint32_t DIB_HEADER_SIZE =
+      40;
+
+  constexpr uint32_t PALETTE_SIZE =
+      256U *
+      4U;
+
+  constexpr uint32_t PIXEL_OFFSET =
+      FILE_HEADER_SIZE +
+      DIB_HEADER_SIZE +
+      PALETTE_SIZE;
+
+  const uint32_t pixelBytes =
+      rowStride *
+      height;
+
+  const uint32_t fileSize =
+      PIXEL_OFFSET +
+      pixelBytes;
+
+  uint8_t header[
+      FILE_HEADER_SIZE +
+      DIB_HEADER_SIZE] = {0};
+
+  header[0] = 'B';
+  header[1] = 'M';
+
+  bmpWrite32(
+      header + 2,
+      fileSize);
+
+  bmpWrite32(
+      header + 10,
+      PIXEL_OFFSET);
+
+  bmpWrite32(
+      header + 14,
+      DIB_HEADER_SIZE);
+
+  bmpWrite32(
+      header + 18,
+      width);
+
+  bmpWrite32(
+      header + 22,
+      height);
+
+  bmpWrite16(
+      header + 26,
+      1);
+
+  bmpWrite16(
+      header + 28,
+      8);
+
+  bmpWrite32(
+      header + 34,
+      pixelBytes);
+
+  bmpWrite32(
+      header + 46,
+      256);
+
+  bmpWrite32(
+      header + 50,
+      256);
+
+  uint8_t palette[
+      PALETTE_SIZE];
+
+  for (int i = 0;
+       i < 256;
+       ++i) {
+    palette[
+        i * 4 + 0] =
+        static_cast<uint8_t>(
+            i);
+
+    palette[
+        i * 4 + 1] =
+        static_cast<uint8_t>(
+            i);
+
+    palette[
+        i * 4 + 2] =
+        static_cast<uint8_t>(
+            i);
+
+    palette[
+        i * 4 + 3] =
+        0;
+  }
+
+  uint8_t* row =
+      static_cast<uint8_t*>(
+          heap_caps_malloc(
+              rowStride,
+              MALLOC_CAP_8BIT));
+
+  if (!row) {
+    return sendJson(
+        req,
+        "{\"success\":false,\"message\":\"Could not allocate BMP row buffer\"}",
+        500);
+  }
+
+  httpd_resp_set_type(
+      req,
+      "image/bmp");
+
+  httpd_resp_set_hdr(
+      req,
+      "Cache-Control",
+      "no-store");
+
+  esp_err_t status =
+      httpd_resp_send_chunk(
+          req,
+          reinterpret_cast<const char*>(
+              header),
+          sizeof(header));
+
+  if (status == ESP_OK) {
+    status =
+        httpd_resp_send_chunk(
+            req,
+            reinterpret_cast<const char*>(
+                palette),
+            sizeof(palette));
+  }
+
+  // BMP stores positive-height images bottom-up.
+  for (int y =
+           lastOcrMaskH - 1;
+       y >= 0 &&
+       status == ESP_OK;
+       --y) {
+    memset(
+        row,
+        0,
+        rowStride);
+
+    memcpy(
+        row,
+        lastOcrMask +
+            static_cast<size_t>(
+                y) *
+                lastOcrMaskW,
+        lastOcrMaskW);
+
+    status =
+        httpd_resp_send_chunk(
+            req,
+            reinterpret_cast<const char*>(
+                row),
+            rowStride);
+  }
+
+  free(row);
+
+  if (status == ESP_OK) {
+    status =
+        httpd_resp_send_chunk(
+            req,
+            nullptr,
+            0);
+  }
+
+  return status;
 }
 
 static esp_err_t streamHandler(httpd_req_t* req) {
@@ -4752,6 +5955,12 @@ static void startServers() {
   readUri.method = HTTP_GET;
   readUri.handler = readHandler;
   httpd_register_uri_handler(mainServer, &readUri);
+
+  httpd_uri_t maskUri = {};
+  maskUri.uri = "/mask";
+  maskUri.method = HTTP_GET;
+  maskUri.handler = maskHandler;
+  httpd_register_uri_handler(mainServer, &maskUri);
 
   httpd_uri_t controlUri = {};
   controlUri.uri = "/control";
