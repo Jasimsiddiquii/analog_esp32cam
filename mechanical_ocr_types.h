@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 
+#define MACHINESENS_MECH_TYPES_V4 1
+
 // ============================================================================
 // Mechanical OCR shared types
 //
@@ -40,6 +42,7 @@ struct MechanicalOcrResult {
   float averageMargin;
   int saturationLimitUsed;
   bool rgb565RescueUsed;
+  bool whiteInkMaskUsed;
   MechanicalDigitResult digits[MECH_MAX_DIGITS];
   char error[128];
 };
